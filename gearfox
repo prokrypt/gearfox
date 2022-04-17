@@ -1,0 +1,143 @@
+#!/bin/bash
+
+sysdev="/sys/devices/system"
+sysdevgpu="/sys/devices/platform/ff9a0000.gpu/devfreq/ff9a0000.gpu"
+groupnamesA04=("Cortex-A53" "MALI-T720 ")
+groupnamesA06=("Cortex-A53" "Cortex-A72" "MALI-T860")
+
+while getopts "vis:" opt; do
+	case $opt in
+		v) debug=1;;
+		s | i) [[ $(id -u) -ne 0 ]] && echo "Needs moar root. Derp." && exit;;&
+		i) interactive=1;;
+		s) gearset=$OPTARG;;
+		*) echo -e "Derp. Usage: gearfox [options]\n\t-h\t\tthis thing.\n\t-i\t\tinteractive mode (control+c to exit)\n\t-s[GEAR]\tset gear\n\t-v\t\tverbose mode (you probably don't want this)"; exit;;
+	esac
+done
+
+# load configuration...
+while read gear values; do
+	[[ ${gear:0:1} = "#" ]] && continue
+	[[ -n $debug ]] && echo "Setting gear[$gear] to ${values[@]}"
+	gears[$gear]=$values
+done < /etc/gearfox.conf
+[[ -n $debug ]] && echo "There are ${#gears[@]} gears in the config file"
+
+# check how many groups of cores we have...
+read -a policies < <(echo $sysdev/cpu/cpufreq/policy[0-9])
+groups=${#policies[@]}
+
+[[ -n $debug ]] && echo "There are $groups groups of cores"
+
+for i in ${!policies[@]}; do
+	read cpulist < ${policies[$i]}/related_cpus
+	[[ -n $debug ]] && echo ${cpulist[@]}
+	cpus[$i]=$cpulist
+done
+
+
+setgear(){
+	# if gearset is set, let's blindly grind it in! \o/
+	[[ -n $gearset ]] && {
+		[[ ! -n ${gears[$gearset]} ]] && echo "Invalid gear. Derp." && return
+		echo "Setting target gear $gearset ("${gears[$gearset]}")"
+		[[ $groups -eq 1 ]] && {
+			read freq1 gov1 gpu <<< ${gears[$gearset]}
+			echo $gov1 > ${policies[0]}/scaling_governor
+			echo $freq1"000" > ${policies[0]}/scaling_max_freq
+			echo $gpu"000000" > $sysdevgpu/max_freq
+		}
+		[[ $groups -eq 2 ]] && {
+			read freq1 gov1 freq2 gov2 gpu <<< ${gears[$gearset]}
+			[[ $freq1 -eq 0 ]] && {
+				for i in ${cpus[0]}; do echo 0 > $sysdev/cpu/cpu$i/online; done
+			} || {
+				for i in ${cpus[0]}; do echo 1 > $sysdev/cpu/cpu$i/online; done
+				echo $freq1"000" > ${policies[0]}/scaling_max_freq
+				echo $gov1 > ${policies[0]}/scaling_governor
+			}
+			[[ $freq2 -eq 0 ]] && {
+				for i in ${cpus[1]}; do echo 0 > $sysdev/cpu/cpu$i/online; done
+			} || {
+				for i in ${cpus[1]}; do echo 1 > $sysdev/cpu/cpu$i/online; done
+				echo $freq2"000" > ${policies[1]}/scaling_max_freq
+				echo $gov2 > ${policies[1]}/scaling_governor
+			}
+			echo $gpu"000000" > $sysdevgpu/max_freq
+		}
+	}
+}
+
+
+printcpu(){
+	read gpufreq < $sysdevgpu/max_freq
+	read gpugov < $sysdevgpu/governor
+
+	# let's display current cpu settings...
+
+	 # group headers
+	echo "+-----------------------+-----------------------+------------+"
+	for i in ${!policies[@]}; do
+		echo -n "| ${groupnamesA06[$i]}            "
+	done
+	echo -n "| MALI T-860 "
+	echo -ne "|\n+-----------------------+-----------------------+"
+	echo -n "------------+"
+	echo
+
+	 # max_frequency and governor
+	for i in ${policies[@]}; do
+		read max_freq < $i/scaling_max_freq
+		read governor < $i/scaling_governor
+		printf "| "%4.0f"MHz "%14s"" ${max_freq}e-03 "($governor)"
+	done
+	printf "| "%0.0f"MHz     " ${gpufreq}e-6
+	echo -ne "|\n+-----+-----+-----+-----+-----------+-----------+"
+	echo -n "------------+"
+	echo
+
+	 # cpu headers
+	echo -n "|"
+	for i in ${!policies[@]}; do
+		for j in ${cpus[$i]}; do
+			for k in $j; do
+				echo -n " $k "
+				[[ $i -eq 1 ]] && echo -n "      "
+				echo -n "  |"
+			done
+		done
+	done
+	echo -n " GPU Govern |"
+	echo
+
+
+	 # online state
+	echo -n "|"
+	for i in ${!policies[@]}; do
+		for j in ${cpus[$i]}; do
+			for k in $j; do
+				read online < $sysdev/cpu/cpu$k/online
+				[[ $online -eq 1 ]] && echo -n " ON " || echo -n " OFF"
+				[[ $i -eq 1 ]] && echo -n "      "
+				echo -n " |" 
+			done
+		done
+	done
+	printf " "%0.7s"... |" $gpugov
+	echo -e "\n+-----+-----+-----+-----+-----------+-----------+------------+"
+}
+
+setgear
+[[ $interactive ]] && echo "Available gears: ${!gears[@]}" && while read -rsN1 in; do
+	echo
+	case $in in
+	[0-9])
+		[[ -n ${gears[$in]} ]] && {
+			gearset="$in"
+			setgear
+			printcpu
+		} || echo "Derp.";;
+		*) echo "Derp.";;
+	esac
+done
+printcpu
